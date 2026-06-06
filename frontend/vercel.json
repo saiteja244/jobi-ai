@@ -4,6 +4,13 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "rewrites": [
-    { "source": "/((?!assets/).*)", "destination": "/index.html" }
+    {
+      "source": "/api/:path*",
+      "destination": "https://ai-career-backend.onrender.com/api/:path*"
+    },
+    {
+      "source": "/((?!assets/|api/).*)",
+      "destination": "/index.html"
+    }
   ]
 }

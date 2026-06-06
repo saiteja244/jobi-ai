@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import API, { API_BASE_URL } from "../services/api";
+import API, { getApiBaseUrl } from "../services/api";
 
 const SILENCE_MS = 800;
 const MIN_SPEECH_MS = 500;
@@ -64,7 +64,7 @@ function playBase64Audio(base64Audio, audioRef, urlRef) {
 }
 
 async function streamVoiceChat(formData, handlers) {
-  const response = await fetch(`${API_BASE_URL}/voice-chat-stream`, {
+  const response = await fetch(`${getApiBaseUrl()}/voice-chat-stream`, {
     method: "POST",
     body: formData,
   });
