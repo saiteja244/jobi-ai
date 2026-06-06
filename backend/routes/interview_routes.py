@@ -305,7 +305,7 @@ def voice_chat_stream():
     )
 
 
-@interview_bp.route("/voice-chat", methods=["POST"])
+@interview_bp.route("/api/voice-chat", methods=["POST"])
 def voice_chat():
     try:
         audio = request.files.get("audio")
