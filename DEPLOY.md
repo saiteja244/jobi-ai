@@ -14,7 +14,7 @@ Your **404 on `upload-resume` / `voice-chat-stream`** means the frontend is not 
    - `GEMINI_MODEL=gemini-flash-lite-latest`
    - `CORS_ORIGINS=https://jobi-ai-omega.vercel.app`
 
-6. Copy your live URL, e.g. `https://ai-career-backend.onrender.com`
+6. Copy your live URL, e.g. `https://jobi-ai.onrender.com`
 
 7. Test: `https://YOUR-SERVICE.onrender.com/health` → `"gemini": {"ok": true}`
 
@@ -32,7 +32,7 @@ Edit **`frontend/public/api-config.json`**:
 
 ```json
 {
-  "apiUrl": "https://YOUR-SERVICE.onrender.com/api"
+  "apiUrl": "https://jobi-ai.onrender.com/api"
 }
 ```
 

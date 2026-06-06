@@ -6,7 +6,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://ai-career-backend.onrender.com/api/:path*"
+      "destination": "https://jobi-ai.onrender.com/api/:path*"
     },
     {
       "source": "/((?!assets/|api/).*)",

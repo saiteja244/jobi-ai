@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ai-career-backend
+    name: jobi-ai
     runtime: python
     rootDir: backend
     plan: free
