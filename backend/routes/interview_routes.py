@@ -2,7 +2,7 @@ import base64
 import os
 import uuid
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request, stream_with_context
 
 import ast
 
@@ -11,6 +11,7 @@ from services.gpt_service import ask_gpt, ask_voice
 from services.interview_state import interview_state
 from services.stt_service import speech_to_text
 from services.tts_service import text_to_speech
+from services.voice_stream import stream_voice_chat
 
 UPLOAD_FOLDER = "uploads"
 if not os.path.exists(UPLOAD_FOLDER):
@@ -279,6 +280,29 @@ Short scorecard: overall /100, technical /10, communication /10,
         return jsonify({"error": "AI service unavailable. Check GEMINI_API_KEY or quota."}), 500
 
     return jsonify({"report": report})
+
+
+@interview_bp.route("/voice-chat-stream", methods=["POST"])
+def voice_chat_stream():
+    """Stream AI text + early TTS audio for low-latency voice replies."""
+    audio = request.files.get("audio")
+    if not audio or not audio.filename:
+        return jsonify({"error": "No audio file provided"}), 400
+
+    path = _save_audio_file(audio, "voice_chat")
+    file_size = os.path.getsize(path) if os.path.isfile(path) else 0
+
+    if file_size < 800:
+        return jsonify({"error": "Recording too short. Please speak a bit longer."}), 400
+
+    return Response(
+        stream_with_context(stream_voice_chat(path, chat_history)),
+        mimetype="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @interview_bp.route("/voice-chat", methods=["POST"])

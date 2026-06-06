@@ -26,8 +26,8 @@ function VoiceInterview() {
     <section id="voice-assistant" className="card voice-card">
       <h2>Live Voice Assistant</h2>
       <p className="voice-hint">
-        Start a live session — talk naturally (short or long). When you pause,
-        the AI replies and listens again after it finishes speaking.
+        Live mode: pause ~1 second after you speak — the AI starts talking within
+        a few seconds (streams word-by-word, does not wait for the full reply).
       </p>
 
       <div className={`voice-live-panel ${isLive ? "is-live" : ""}`}>

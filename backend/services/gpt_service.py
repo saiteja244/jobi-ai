@@ -126,6 +126,19 @@ def _generate_once(model, prompt, max_tokens):
     return _extract_text(response)
 
 
+def _generate_stream_once(model, prompt, max_tokens):
+    """Generate content with streaming for real-time responses."""
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
+            temperature=0.35,
+        ),
+        stream=True,
+    )
+    return response
+
+
 def _generate_with_fallback(system_instruction, prompt, max_tokens):
     global _active_model
 
@@ -167,6 +180,82 @@ def _generate_with_fallback(system_instruction, prompt, max_tokens):
     )
 
 
+def _generate_stream_with_fallback(system_instruction, prompt, max_tokens):
+    """Generate content with streaming and fallback support."""
+    global _active_model
+
+    if not _api_key():
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. Add it to backend/.env "
+            "(get a free key at https://aistudio.google.com/apikey)."
+        )
+
+    last_error = "No response from AI"
+    preferred = _configured_model()
+
+    for model_name in _fallback_models():
+        try:
+            model = _get_model(model_name, system_instruction)
+            stream = _generate_stream_once(model, prompt, max_tokens)
+
+            if stream:
+                _active_model = model_name
+                if model_name != preferred:
+                    print(f"Using fallback Gemini model: {model_name}")
+                return stream
+
+            last_error = f"{model_name} returned empty stream"
+        except Exception as e:
+            last_error = str(e)
+            print(f"Gemini {model_name} streaming failed:", e)
+            if _is_retryable_error(e):
+                continue
+            break
+
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        "All Gemini models failed (quota exhausted or API error). "
+        "Set GEMINI_MODEL=gemini-flash-lite-latest in backend/.env, "
+        "wait a few minutes, or create a new API key at "
+        "https://aistudio.google.com/apikey"
+    )
+
+
+def iter_voice_reply(user_message, conversation_history=None):
+    """Stream Gemini tokens for voice replies (word-by-word)."""
+    user_message = (user_message or "").strip()
+    if not user_message:
+        return
+
+    history_block = ""
+    if conversation_history:
+        history_block = (
+            "Recent conversation (context only):\n"
+            + "\n".join(conversation_history[-8:])
+            + "\n\n"
+        )
+
+    prompt = f"""{history_block}User message:
+\"\"\"{user_message}\"\"\"
+
+Reply only to that message. Under {VOICE_MAX_WORDS} words. Start with the direct answer immediately."""
+
+    stream = _generate_stream_with_fallback(
+        VOICE_SYSTEM,
+        prompt,
+        MAX_TOKENS["voice"],
+    )
+
+    for chunk in stream:
+        try:
+            text = chunk.text
+        except (AttributeError, ValueError):
+            text = ""
+        if text:
+            yield text
+
+
 def ask_voice(user_message, conversation_history=None):
     user_message = (user_message or "").strip()
     if not user_message:
@@ -186,6 +275,32 @@ def ask_voice(user_message, conversation_history=None):
 Reply only to that message. Under {VOICE_MAX_WORDS} words."""
 
     return ask_gpt(prompt, mode="voice")
+
+
+def ask_voice_stream(user_message, conversation_history=None):
+    """Stream voice responses for real-time conversation."""
+    user_message = (user_message or "").strip()
+    if not user_message:
+        return None
+
+    history_block = ""
+    if conversation_history:
+        history_block = (
+            "Recent conversation (context only):\n"
+            + "\n".join(conversation_history[-8:])
+            + "\n\n"
+        )
+
+    prompt = f"""{history_block}User message:
+\"\"\"{user_message}\"\"\"
+
+Reply only to that message. Under {VOICE_MAX_WORDS} words."""
+
+    max_tokens = MAX_TOKENS.get("voice", MAX_TOKENS["default"])
+    system = VOICE_SYSTEM
+
+    stream = _generate_stream_with_fallback(system, prompt, max_tokens)
+    return stream
 
 
 def ask_gpt(prompt, mode="default"):

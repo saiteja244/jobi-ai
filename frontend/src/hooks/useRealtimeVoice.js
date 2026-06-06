@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import API from "../services/api";
+import API, { API_BASE_URL } from "../services/api";
 
-const SILENCE_MS = 1500;
-const MIN_SPEECH_MS = 900;
-const MIN_RECORD_MS = 1200;
+const SILENCE_MS = 800;
+const MIN_SPEECH_MS = 500;
+const MIN_RECORD_MS = 800;
 const VOLUME_THRESHOLD = 0.02;
-const MIN_BLOB_BYTES = 1200;
-const POST_SPEAK_COOLDOWN_MS = 1000;
-const RETRY_COOLDOWN_MS = 2000;
+const MIN_BLOB_BYTES = 1000;
+const POST_SPEAK_COOLDOWN_MS = 500;
+const RETRY_COOLDOWN_MS = 1500;
 
 function getRmsVolume(analyser) {
   const data = new Uint8Array(analyser.fftSize);
@@ -63,6 +63,51 @@ function playBase64Audio(base64Audio, audioRef, urlRef) {
   });
 }
 
+async function streamVoiceChat(formData, handlers) {
+  const response = await fetch(`${API_BASE_URL}/voice-chat-stream`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    let message = "Voice request failed";
+    try {
+      const data = await response.json();
+      message = data.error || message;
+    } catch {
+      /* ignore */
+    }
+    const err = new Error(message);
+    err.status = response.status;
+    err.recoverable = response.status === 400;
+    throw err;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      await handlers.onEvent(event);
+    }
+  }
+
+  if (buffer.trim()) {
+    const event = JSON.parse(buffer);
+    await handlers.onEvent(event);
+  }
+}
+
 export function useRealtimeVoice() {
   const [active, setActive] = useState(false);
   const [phase, setPhase] = useState("idle");
@@ -87,6 +132,9 @@ export function useRealtimeVoice() {
   const listenAfterRef = useRef(0);
   const retryAfterRef = useRef(0);
   const captureMimeRef = useRef("audio/webm");
+  const audioQueueRef = useRef([]);
+  const audioPlayingRef = useRef(false);
+  const abortRef = useRef(null);
 
   const setPhaseSafe = (next) => {
     phaseRef.current = next;
@@ -94,6 +142,8 @@ export function useRealtimeVoice() {
   };
 
   const stopPlayback = () => {
+    audioQueueRef.current = [];
+    audioPlayingRef.current = false;
     const audio = playbackAudioRef.current;
     if (audio) {
       audio.pause();
@@ -102,7 +152,40 @@ export function useRealtimeVoice() {
     }
   };
 
+  const playNextInQueue = useCallback(async () => {
+    if (audioPlayingRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) return;
+
+    audioPlayingRef.current = true;
+    setPhaseSafe("speaking");
+
+    try {
+      await playBase64Audio(next, playbackAudioRef, playbackUrlRef);
+    } catch (e) {
+      console.warn("Audio playback:", e);
+    } finally {
+      audioPlayingRef.current = false;
+      if (audioQueueRef.current.length > 0) {
+        await playNextInQueue();
+      }
+    }
+  }, []);
+
+  const enqueueAudio = useCallback(
+    (base64) => {
+      if (!base64) return;
+      audioQueueRef.current.push(base64);
+      playNextInQueue();
+    },
+    [playNextInQueue]
+  );
+
   const cleanupStream = useCallback(() => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
     if (rafRef.current) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
@@ -131,7 +214,7 @@ export function useRealtimeVoice() {
   }, []);
 
   const resumeListening = useCallback(() => {
-    if (activeRef.current) {
+    if (activeRef.current && !audioPlayingRef.current && !audioQueueRef.current.length) {
       setPhaseSafe("listening");
     }
   }, []);
@@ -165,31 +248,76 @@ export function useRealtimeVoice() {
     const formData = new FormData();
     formData.append("audio", blob, "utterance.webm");
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    let userText = "";
+    let assistantText = "";
+    let assistantMessageStarted = false;
+
     try {
-      const result = await API.post("/voice-chat", formData);
+      await streamVoiceChat(formData, {
+        onEvent: async (event) => {
+          if (event.event === "transcript") {
+            userText = event.user_text || "";
+            setMessages((prev) => [...prev, { role: "user", text: userText }]);
+          }
 
-      const userText = result.data.user_text || "";
-      const assistantText =
-        result.data.ai_response || result.data.ai_text || "";
+          if (event.event === "delta") {
+            assistantText += event.delta || "";
+            if (!assistantMessageStarted) {
+              assistantMessageStarted = true;
+              setMessages((prev) => [
+                ...prev,
+                { role: "assistant", text: assistantText },
+              ]);
+            } else {
+              const snapshot = assistantText;
+              setMessages((prev) => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last?.role === "assistant") {
+                  updated[updated.length - 1] = {
+                    ...last,
+                    text: snapshot,
+                  };
+                }
+                return updated;
+              });
+            }
+          }
 
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", text: userText },
-        { role: "assistant", text: assistantText },
-      ]);
+          if (event.event === "audio" && event.audio) {
+            enqueueAudio(event.audio);
+          }
 
-      setPhaseSafe("speaking");
+          if (event.event === "done") {
+            assistantText = event.ai_text || event.ai_response || assistantText;
+            setMessages((prev) => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last?.role === "assistant") {
+                updated[updated.length - 1] = {
+                  ...last,
+                  text: assistantText,
+                };
+              } else if (assistantText) {
+                updated.push({ role: "assistant", text: assistantText });
+              }
+              return updated;
+            });
+          }
 
-      if (result.data.audio) {
-        await playBase64Audio(
-          result.data.audio,
-          playbackAudioRef,
-          playbackUrlRef
-        );
-      }
+          if (event.event === "error") {
+            throw new Error(event.error || "Voice stream failed");
+          }
+        },
+      });
 
       listenAfterRef.current = Date.now() + POST_SPEAK_COOLDOWN_MS;
     } catch (err) {
+      if (err.name === "AbortError") return;
+
       if (err.recoverable || err.status === 400) {
         retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
       } else {
@@ -197,10 +325,20 @@ export function useRealtimeVoice() {
         retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
       }
     } finally {
+      abortRef.current = null;
       isSendingRef.current = false;
-      resumeListening();
+
+      const waitForAudio = () => {
+        if (audioPlayingRef.current || audioQueueRef.current.length > 0) {
+          window.setTimeout(waitForAudio, 200);
+          return;
+        }
+        listenAfterRef.current = Date.now() + POST_SPEAK_COOLDOWN_MS;
+        resumeListening();
+      };
+      waitForAudio();
     }
-  }, [resumeListening]);
+  }, [enqueueAudio, resumeListening]);
 
   const startCapture = useCallback(() => {
     if (!streamRef.current || isCapturingRef.current || isSendingRef.current) {
@@ -232,10 +370,10 @@ export function useRealtimeVoice() {
         if (activeRef.current && !isSendingRef.current) {
           sendUtterance();
         }
-      }, 120);
+      }, 80);
     };
 
-    recorder.start(250);
+    recorder.start(200);
     isCapturingRef.current = true;
     speechStartedAtRef.current = Date.now();
     silenceStartedAtRef.current = null;
@@ -292,7 +430,8 @@ export function useRealtimeVoice() {
       currentPhase === "listening" &&
       pastCooldown &&
       pastRetry &&
-      !isSendingRef.current
+      !isSendingRef.current &&
+      !audioPlayingRef.current
     ) {
       if (loud) {
         silenceStartedAtRef.current = null;
