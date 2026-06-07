@@ -15,6 +15,7 @@ client = SarvamAI(
 
 TTS_VOICE_REPLY_WORDS = int(os.getenv("TTS_MAX_WORDS", str(VOICE_MAX_WORDS)))
 TTS_QUESTION_WORDS = int(os.getenv("TTS_QUESTION_MAX_WORDS", "120"))
+TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "shubh")
 
 
 def _strip_markdown(text):
@@ -27,7 +28,7 @@ def _synthesize(clean_text):
     response = client.text_to_speech.convert(
         text=clean_text,
         target_language_code="en-IN",
-        speaker="shubh",
+        speaker=TTS_SPEAKER,
         model="bulbul:v3",
     )
     return "".join(response.audios)

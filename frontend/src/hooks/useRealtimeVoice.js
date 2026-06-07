@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import API, { getApiBaseUrl } from "../services/api";
+import {
+  createSpeechRecognizer,
+  createSpeechSpeaker,
+  isBrowserSttSupported,
+  isBrowserTtsSupported,
+} from "../utils/browserSpeech";
 
-const SILENCE_MS = 800;
-const MIN_SPEECH_MS = 500;
-const MIN_RECORD_MS = 800;
+const SILENCE_MS = 600;
+const MIN_SPEECH_MS = 400;
+const MIN_RECORD_MS = 700;
 const VOLUME_THRESHOLD = 0.02;
 const MIN_BLOB_BYTES = 1000;
-const POST_SPEAK_COOLDOWN_MS = 500;
-const RETRY_COOLDOWN_MS = 1500;
+const POST_SPEAK_COOLDOWN_MS = 300;
+const RETRY_COOLDOWN_MS = 1200;
+
+const USE_FAST_PATH = isBrowserSttSupported() && isBrowserTtsSupported();
 
 function getRmsVolume(analyser) {
   const data = new Uint8Array(analyser.fftSize);
@@ -63,6 +71,32 @@ function playBase64Audio(base64Audio, audioRef, urlRef) {
   });
 }
 
+async function readNdjsonStream(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      await onEvent(event);
+    }
+  }
+
+  if (buffer.trim()) {
+    const event = JSON.parse(buffer);
+    await onEvent(event);
+  }
+}
+
 async function streamVoiceChat(formData, handlers) {
   const response = await fetch(`${getApiBaseUrl()}/voice-chat-stream`, {
     method: "POST",
@@ -83,29 +117,31 @@ async function streamVoiceChat(formData, handlers) {
     throw err;
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  await readNdjsonStream(response, handlers.onEvent);
+}
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+async function streamVoiceChatText(text, handlers) {
+  const response = await fetch(`${getApiBaseUrl()}/voice-text-stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const event = JSON.parse(line);
-      await handlers.onEvent(event);
+  if (!response.ok) {
+    let message = "Voice request failed";
+    try {
+      const data = await response.json();
+      message = data.error || message;
+    } catch {
+      /* ignore */
     }
+    const err = new Error(message);
+    err.status = response.status;
+    err.recoverable = response.status === 400;
+    throw err;
   }
 
-  if (buffer.trim()) {
-    const event = JSON.parse(buffer);
-    await handlers.onEvent(event);
-  }
+  await readNdjsonStream(response, handlers.onEvent);
 }
 
 export function useRealtimeVoice() {
@@ -114,6 +150,7 @@ export function useRealtimeVoice() {
   const [messages, setMessages] = useState([]);
   const [error, setError] = useState("");
   const [liveLevel, setLiveLevel] = useState(0);
+  const [interimText, setInterimText] = useState("");
 
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -121,6 +158,7 @@ export function useRealtimeVoice() {
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
   const rafRef = useRef(null);
+  const vadLoopRef = useRef(null);
   const phaseRef = useRef("idle");
   const speechStartedAtRef = useRef(null);
   const silenceStartedAtRef = useRef(null);
@@ -135,6 +173,10 @@ export function useRealtimeVoice() {
   const audioQueueRef = useRef([]);
   const audioPlayingRef = useRef(false);
   const abortRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const pendingTextRef = useRef("");
+  const interimTextRef = useRef("");
+  const speakerRef = useRef(null);
 
   const setPhaseSafe = (next) => {
     phaseRef.current = next;
@@ -144,11 +186,20 @@ export function useRealtimeVoice() {
   const stopPlayback = () => {
     audioQueueRef.current = [];
     audioPlayingRef.current = false;
+    speakerRef.current?.stop();
     const audio = playbackAudioRef.current;
     if (audio) {
       audio.pause();
       audio.onended = null;
       audio.onerror = null;
+    }
+  };
+
+  const revokePlaybackUrl = () => {
+    const playbackUrl = playbackUrlRef.current;
+    if (playbackUrl) {
+      URL.revokeObjectURL(playbackUrl);
+      playbackUrlRef.current = null;
     }
   };
 
@@ -181,6 +232,34 @@ export function useRealtimeVoice() {
     [playNextInQueue]
   );
 
+  const stopRecognition = useCallback(() => {
+    const rec = recognitionRef.current;
+    if (!rec) return;
+    try {
+      rec.stop();
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const startRecognition = useCallback(() => {
+    if (!USE_FAST_PATH || !activeRef.current || isSendingRef.current) return;
+    if (Date.now() < listenAfterRef.current) return;
+    if (Date.now() < retryAfterRef.current) return;
+
+    const rec = recognitionRef.current;
+    if (!rec) return;
+
+    try {
+      speechStartedAtRef.current = null;
+      silenceStartedAtRef.current = null;
+      rec.start();
+      setPhaseSafe("listening");
+    } catch {
+      /* already started */
+    }
+  }, []);
+
   const cleanupStream = useCallback(() => {
     if (abortRef.current) {
       abortRef.current.abort();
@@ -190,6 +269,8 @@ export function useRealtimeVoice() {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     }
+    stopRecognition();
+    recognitionRef.current = null;
     if (mediaRecorderRef.current?.state === "recording") {
       try {
         mediaRecorderRef.current.stop();
@@ -200,6 +281,9 @@ export function useRealtimeVoice() {
     mediaRecorderRef.current = null;
     isCapturingRef.current = false;
     isSendingRef.current = false;
+    pendingTextRef.current = "";
+    interimTextRef.current = "";
+    setInterimText("");
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -211,23 +295,151 @@ export function useRealtimeVoice() {
       audioContextRef.current = null;
     }
     analyserRef.current = null;
-  }, []);
+  }, [stopRecognition]);
 
-  const resumeListening = useCallback(() => {
-    if (activeRef.current && !audioPlayingRef.current && !audioQueueRef.current.length) {
-      setPhaseSafe("listening");
+  const waitForSpeechThenListen = useCallback(() => {
+    const check = () => {
+      const speaking =
+        speakerRef.current?.isActive() ||
+        (typeof speechSynthesis !== "undefined" && speechSynthesis.speaking) ||
+        audioPlayingRef.current ||
+        audioQueueRef.current.length > 0;
+
+      if (speaking) {
+        window.setTimeout(check, 80);
+        return;
+      }
+
+      listenAfterRef.current = Date.now() + POST_SPEAK_COOLDOWN_MS;
+      if (USE_FAST_PATH) {
+        startRecognition();
+      } else if (activeRef.current) {
+        setPhaseSafe("listening");
+      }
+    };
+    check();
+  }, [startRecognition]);
+
+  const handleStreamEvents = useCallback(
+  async (event, state) => {
+    const { assistantTextRef, assistantMessageStartedRef } = state;
+
+    if (event.event === "transcript") {
+      const userText = event.user_text || "";
+      setMessages((prev) => [...prev, { role: "user", text: userText }]);
     }
-  }, []);
 
-  const sendUtterance = useCallback(async () => {
+    if (event.event === "delta") {
+      const delta = event.delta || "";
+      assistantTextRef.current += delta;
+
+      if (USE_FAST_PATH && speakerRef.current) {
+        speakerRef.current.append(delta);
+        setPhaseSafe("speaking");
+      }
+
+      if (!assistantMessageStartedRef.current) {
+        assistantMessageStartedRef.current = true;
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", text: assistantTextRef.current },
+        ]);
+      } else {
+        const snapshot = assistantTextRef.current;
+        setMessages((prev) => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === "assistant") {
+            updated[updated.length - 1] = { ...last, text: snapshot };
+          }
+          return updated;
+        });
+      }
+    }
+
+    if (event.event === "audio" && event.audio && !USE_FAST_PATH) {
+      enqueueAudio(event.audio);
+    }
+
+    if (event.event === "done") {
+      const finalText =
+        event.ai_text || event.ai_response || assistantTextRef.current;
+      assistantTextRef.current = finalText;
+      if (USE_FAST_PATH) {
+        speakerRef.current?.flush();
+      }
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        if (last?.role === "assistant") {
+          updated[updated.length - 1] = { ...last, text: finalText };
+        } else if (finalText) {
+          updated.push({ role: "assistant", text: finalText });
+        }
+        return updated;
+      });
+    }
+
+    if (event.event === "error") {
+      throw new Error(event.error || "Voice stream failed");
+    }
+  },
+  [enqueueAudio]
+);
+
+  const sendTextUtterance = useCallback(
+    async (text) => {
+      const trimmed = (text || "").trim();
+      if (!trimmed || isSendingRef.current) return;
+      if (Date.now() < retryAfterRef.current) {
+        startRecognition();
+        return;
+      }
+
+      isSendingRef.current = true;
+      stopRecognition();
+      setInterimText("");
+      setPhaseSafe("processing");
+      setError("");
+
+      speakerRef.current = createSpeechSpeaker();
+
+      const assistantTextRef = { current: "" };
+      const assistantMessageStartedRef = { current: false };
+
+      try {
+        await streamVoiceChatText(trimmed, {
+          onEvent: (event) =>
+            handleStreamEvents(event, {
+              assistantTextRef,
+              assistantMessageStartedRef,
+            }),
+        });
+      } catch (err) {
+        speakerRef.current?.stop();
+        if (err.recoverable || err.status === 400) {
+          retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
+        } else {
+          setError(err.message || "Voice request failed.");
+          retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
+        }
+      } finally {
+        isSendingRef.current = false;
+        waitForSpeechThenListen();
+      }
+    },
+    [handleStreamEvents, startRecognition, stopRecognition, waitForSpeechThenListen]
+  );
+
+  const sendAudioUtterance = useCallback(async () => {
     if (isSendingRef.current) return;
     if (Date.now() < retryAfterRef.current) {
-      resumeListening();
+      setPhaseSafe("listening");
       return;
     }
 
     if (!chunksRef.current.length) {
-      resumeListening();
+      setPhaseSafe("listening");
       return;
     }
 
@@ -237,7 +449,7 @@ export function useRealtimeVoice() {
     chunksRef.current = [];
 
     if (blob.size < MIN_BLOB_BYTES) {
-      resumeListening();
+      setPhaseSafe("listening");
       return;
     }
 
@@ -248,76 +460,18 @@ export function useRealtimeVoice() {
     const formData = new FormData();
     formData.append("audio", blob, "utterance.webm");
 
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    let userText = "";
-    let assistantText = "";
-    let assistantMessageStarted = false;
+    const assistantTextRef = { current: "" };
+    const assistantMessageStartedRef = { current: false };
 
     try {
       await streamVoiceChat(formData, {
-        onEvent: async (event) => {
-          if (event.event === "transcript") {
-            userText = event.user_text || "";
-            setMessages((prev) => [...prev, { role: "user", text: userText }]);
-          }
-
-          if (event.event === "delta") {
-            assistantText += event.delta || "";
-            if (!assistantMessageStarted) {
-              assistantMessageStarted = true;
-              setMessages((prev) => [
-                ...prev,
-                { role: "assistant", text: assistantText },
-              ]);
-            } else {
-              const snapshot = assistantText;
-              setMessages((prev) => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (last?.role === "assistant") {
-                  updated[updated.length - 1] = {
-                    ...last,
-                    text: snapshot,
-                  };
-                }
-                return updated;
-              });
-            }
-          }
-
-          if (event.event === "audio" && event.audio) {
-            enqueueAudio(event.audio);
-          }
-
-          if (event.event === "done") {
-            assistantText = event.ai_text || event.ai_response || assistantText;
-            setMessages((prev) => {
-              const updated = [...prev];
-              const last = updated[updated.length - 1];
-              if (last?.role === "assistant") {
-                updated[updated.length - 1] = {
-                  ...last,
-                  text: assistantText,
-                };
-              } else if (assistantText) {
-                updated.push({ role: "assistant", text: assistantText });
-              }
-              return updated;
-            });
-          }
-
-          if (event.event === "error") {
-            throw new Error(event.error || "Voice stream failed");
-          }
-        },
+        onEvent: (event) =>
+          handleStreamEvents(event, {
+            assistantTextRef,
+            assistantMessageStartedRef,
+          }),
       });
-
-      listenAfterRef.current = Date.now() + POST_SPEAK_COOLDOWN_MS;
     } catch (err) {
-      if (err.name === "AbortError") return;
-
       if (err.recoverable || err.status === 400) {
         retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
       } else {
@@ -325,20 +479,10 @@ export function useRealtimeVoice() {
         retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
       }
     } finally {
-      abortRef.current = null;
       isSendingRef.current = false;
-
-      const waitForAudio = () => {
-        if (audioPlayingRef.current || audioQueueRef.current.length > 0) {
-          window.setTimeout(waitForAudio, 200);
-          return;
-        }
-        listenAfterRef.current = Date.now() + POST_SPEAK_COOLDOWN_MS;
-        resumeListening();
-      };
-      waitForAudio();
+      waitForSpeechThenListen();
     }
-  }, [enqueueAudio, resumeListening]);
+  }, [handleStreamEvents, waitForSpeechThenListen]);
 
   const startCapture = useCallback(() => {
     if (!streamRef.current || isCapturingRef.current || isSendingRef.current) {
@@ -368,16 +512,16 @@ export function useRealtimeVoice() {
 
       window.setTimeout(() => {
         if (activeRef.current && !isSendingRef.current) {
-          sendUtterance();
+          sendAudioUtterance();
         }
-      }, 80);
+      }, 60);
     };
 
     recorder.start(200);
     isCapturingRef.current = true;
     speechStartedAtRef.current = Date.now();
     silenceStartedAtRef.current = null;
-  }, [sendUtterance]);
+  }, [sendAudioUtterance]);
 
   const stopCapture = useCallback(() => {
     const recorder = mediaRecorderRef.current;
@@ -411,6 +555,12 @@ export function useRealtimeVoice() {
     }
   }, []);
 
+  const scheduleVadLoop = useCallback(() => {
+    rafRef.current = requestAnimationFrame(() => {
+      vadLoopRef.current?.();
+    });
+  }, []);
+
   const runVadLoop = useCallback(() => {
     const analyser = analyserRef.current;
     if (!analyser || !activeRef.current) return;
@@ -425,6 +575,36 @@ export function useRealtimeVoice() {
     const loud = volume > VOLUME_THRESHOLD;
     const pastCooldown = Date.now() >= listenAfterRef.current;
     const pastRetry = Date.now() >= retryAfterRef.current;
+
+    if (USE_FAST_PATH) {
+      if (
+        currentPhase === "listening" &&
+        pastCooldown &&
+        pastRetry &&
+        !isSendingRef.current
+      ) {
+        if (loud) {
+          if (!speechStartedAtRef.current) {
+            speechStartedAtRef.current = Date.now();
+          }
+          silenceStartedAtRef.current = null;
+        } else if (speechStartedAtRef.current) {
+          const speechDuration = Date.now() - speechStartedAtRef.current;
+          if (speechDuration >= MIN_SPEECH_MS) {
+            if (!silenceStartedAtRef.current) {
+              silenceStartedAtRef.current = Date.now();
+            } else if (Date.now() - silenceStartedAtRef.current >= SILENCE_MS) {
+              stopRecognition();
+              silenceStartedAtRef.current = null;
+              speechStartedAtRef.current = null;
+            }
+          }
+        }
+      }
+
+      scheduleVadLoop();
+      return;
+    }
 
     if (
       currentPhase === "listening" &&
@@ -452,13 +632,65 @@ export function useRealtimeVoice() {
       }
     }
 
-    rafRef.current = requestAnimationFrame(runVadLoop);
-  }, [startCapture, stopCapture]);
+    scheduleVadLoop();
+  }, [scheduleVadLoop, startCapture, stopCapture, stopRecognition]);
+
+  useEffect(() => {
+    vadLoopRef.current = runVadLoop;
+  }, [runVadLoop]);
+
+  const setupBrowserRecognition = useCallback(() => {
+    const recognition = createSpeechRecognizer({
+      onInterim: (text) => {
+        interimTextRef.current = text;
+        setInterimText(text);
+      },
+      onFinal: (text) => {
+        interimTextRef.current = "";
+        setInterimText("");
+        pendingTextRef.current = `${pendingTextRef.current} ${text}`.trim();
+      },
+      onError: (code) => {
+        if (code === "not-allowed") {
+          setError("Microphone access denied for speech recognition.");
+        }
+      },
+    });
+
+    if (!recognition) return false;
+
+    recognition.onend = () => {
+      const text = pendingTextRef.current.trim();
+      pendingTextRef.current = "";
+
+      if (text && activeRef.current && !isSendingRef.current) {
+        sendTextUtterance(text);
+        return;
+      }
+
+      if (
+        activeRef.current &&
+        !isSendingRef.current &&
+        phaseRef.current === "listening"
+      ) {
+        window.setTimeout(() => startRecognition(), 120);
+      }
+    };
+
+    recognitionRef.current = recognition;
+    return true;
+  }, [sendTextUtterance, startRecognition]);
 
   const startConversation = useCallback(async () => {
     setError("");
     retryAfterRef.current = 0;
     listenAfterRef.current = 0;
+
+    if (typeof speechSynthesis !== "undefined") {
+      speechSynthesis.getVoices();
+    }
+
+    fetch(`${getApiBaseUrl()}/health`, { method: "GET" }).catch(() => {});
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -470,6 +702,9 @@ export function useRealtimeVoice() {
       });
 
       streamRef.current = stream;
+      activeRef.current = true;
+      setActive(true);
+
       const audioContext = new AudioContext();
       await audioContext.resume();
       const source = audioContext.createMediaStreamSource(stream);
@@ -480,15 +715,21 @@ export function useRealtimeVoice() {
 
       audioContextRef.current = audioContext;
       analyserRef.current = analyser;
-      activeRef.current = true;
-      setActive(true);
+
+      if (USE_FAST_PATH && setupBrowserRecognition()) {
+        setPhaseSafe("listening");
+        startRecognition();
+        runVadLoop();
+        return;
+      }
+
       setPhaseSafe("listening");
       runVadLoop();
     } catch (err) {
       setError("Microphone access denied or unavailable.");
       console.error(err);
     }
-  }, [runVadLoop]);
+  }, [runVadLoop, setupBrowserRecognition, startRecognition]);
 
   const endConversation = useCallback(() => {
     activeRef.current = false;
@@ -497,6 +738,7 @@ export function useRealtimeVoice() {
     cleanupStream();
     setPhaseSafe("idle");
     setLiveLevel(0);
+    setInterimText("");
   }, [cleanupStream]);
 
   const clearChat = useCallback(async () => {
@@ -514,9 +756,7 @@ export function useRealtimeVoice() {
       activeRef.current = false;
       stopPlayback();
       cleanupStream();
-      if (playbackUrlRef.current) {
-        URL.revokeObjectURL(playbackUrlRef.current);
-      }
+      revokePlaybackUrl();
     };
   }, [cleanupStream]);
 
@@ -526,6 +766,8 @@ export function useRealtimeVoice() {
     messages,
     error,
     liveLevel,
+    interimText,
+    fastMode: USE_FAST_PATH,
     startConversation,
     endConversation,
     clearChat,

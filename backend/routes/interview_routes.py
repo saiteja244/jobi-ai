@@ -11,7 +11,7 @@ from services.gpt_service import ask_gpt, ask_voice
 from services.interview_state import interview_state
 from services.stt_service import speech_to_text
 from services.tts_service import text_to_speech
-from services.voice_stream import stream_voice_chat
+from services.voice_stream import stream_voice_chat, stream_voice_chat_text
 
 UPLOAD_FOLDER = "uploads"
 if not os.path.exists(UPLOAD_FOLDER):
@@ -280,6 +280,24 @@ Short scorecard: overall /100, technical /10, communication /10,
         return jsonify({"error": "AI service unavailable. Check GEMINI_API_KEY or quota."}), 500
 
     return jsonify({"report": report})
+
+
+@interview_bp.route("/voice-text-stream", methods=["POST"])
+def voice_text_stream():
+    """Fast path: client STT + client TTS; stream Gemini text only."""
+    data = request.get_json(silent=True) or {}
+    user_text = (data.get("text") or "").strip()
+    if not user_text:
+        return jsonify({"error": "No text provided"}), 400
+
+    return Response(
+        stream_with_context(stream_voice_chat_text(user_text, chat_history)),
+        mimetype="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @interview_bp.route("/voice-chat-stream", methods=["POST"])

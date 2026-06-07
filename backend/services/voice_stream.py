@@ -45,6 +45,48 @@ def _extract_remainder(full_text, spoken_segment):
     return full_text[idx + len(spoken_segment):].strip()
 
 
+def stream_voice_chat_text(user_text, chat_history):
+    """Fast path: text in → streamed Gemini out. No STT/TTS (client handles voice)."""
+    try:
+        user_text = (user_text or "").strip()
+        if not user_text:
+            yield _line({"event": "error", "error": "Empty message."})
+            return
+
+        yield _line({"event": "transcript", "user_text": user_text})
+        chat_history.append(f"User: {user_text}")
+
+        full_text = ""
+
+        try:
+            for delta in iter_voice_reply(user_text, chat_history[:-1]):
+                full_text += delta
+                yield _line({"event": "delta", "delta": delta})
+        except RuntimeError as e:
+            chat_history.pop()
+            yield _line({"event": "error", "error": str(e)})
+            return
+
+        full_text = truncate_words(full_text)
+
+        if not full_text.strip():
+            chat_history.pop()
+            yield _line({"event": "error", "error": "AI returned an empty reply."})
+            return
+
+        chat_history.append(f"Assistant: {full_text}")
+
+        yield _line({
+            "event": "done",
+            "ai_text": full_text,
+            "ai_response": full_text,
+        })
+
+    except Exception as e:
+        print("voice_stream text error:", e)
+        yield _line({"event": "error", "error": f"Voice processing failed: {e}"})
+
+
 def stream_voice_chat(audio_path, chat_history):
     try:
         user_text = speech_to_text(audio_path)

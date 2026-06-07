@@ -14,6 +14,8 @@ function VoiceInterview() {
     messages,
     error,
     liveLevel,
+    interimText,
+    fastMode,
     startConversation,
     endConversation,
     clearChat,
@@ -26,8 +28,9 @@ function VoiceInterview() {
     <section id="voice-assistant" className="card voice-card">
       <h2>Live Voice Assistant</h2>
       <p className="voice-hint">
-        Live mode: pause ~1 second after you speak — the AI starts talking within
-        a few seconds (streams word-by-word, does not wait for the full reply).
+        {fastMode
+          ? "Fast mode: your browser transcribes speech locally, then the AI replies in ~2–4 seconds."
+          : "Live mode: pause briefly after you speak — the AI streams a reply word by word."}
       </p>
 
       <div className={`voice-live-panel ${isLive ? "is-live" : ""}`}>
@@ -47,6 +50,12 @@ function VoiceInterview() {
             Click &quot;Start live conversation&quot;, then ask something like
             &quot;How do I answer why I left my last job?&quot;
           </p>
+        )}
+        {interimText && phase === "listening" && (
+          <div className="chat-bubble user interim">
+            <strong>You</strong>
+            <p>{interimText}…</p>
+          </div>
         )}
         {messages.map((msg, index) => (
           <div

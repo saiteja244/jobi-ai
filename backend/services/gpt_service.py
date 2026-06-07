@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-VOICE_MAX_WORDS = int(os.getenv("VOICE_MAX_WORDS", "75"))
+VOICE_MAX_WORDS = int(os.getenv("VOICE_MAX_WORDS", "50"))
 
 DEFAULT_MODEL = "gemini-flash-lite-latest"
 
@@ -34,12 +34,10 @@ def _fallback_models():
 CONCISE_SYSTEM = """You are a career interview coach.
 Be short and useful: bullets over paragraphs, no filler, only key points."""
 
-VOICE_SYSTEM = """You are a voice career coach.
-Answer ONLY the user's specific question — not a full lesson on the topic.
-Use chat history only for pronouns (it/that). Max ~75 words (~30 sec spoken). No markdown."""
+VOICE_SYSTEM = """Voice career coach. Answer only the question asked. Under 50 words. No markdown. Lead with the direct answer."""
 
 MAX_TOKENS = {
-    "voice": 512,
+    "voice": 256,
     "chat": 512,
     "resume": 512,
     "jd": 768,
