@@ -402,7 +402,9 @@ export function useRealtimeVoice() {
       setPhaseSafe("processing");
       setError("");
 
-      speakerRef.current = createSpeechSpeaker();
+      speakerRef.current = createSpeechSpeaker({
+        onIdle: waitForSpeechThenListen,
+      });
 
       const assistantTextRef = { current: "" };
       const assistantMessageStartedRef = { current: false };
@@ -655,27 +657,26 @@ export function useRealtimeVoice() {
           setError("Microphone access denied for speech recognition.");
         }
       },
+      onEnd: () => {
+        const text = pendingTextRef.current.trim();
+        pendingTextRef.current = "";
+
+        if (text && activeRef.current && !isSendingRef.current) {
+          sendTextUtterance(text);
+          return;
+        }
+
+        if (
+          activeRef.current &&
+          !isSendingRef.current &&
+          phaseRef.current === "listening"
+        ) {
+          window.setTimeout(() => startRecognition(), 120);
+        }
+      },
     });
 
     if (!recognition) return false;
-
-    recognition.onend = () => {
-      const text = pendingTextRef.current.trim();
-      pendingTextRef.current = "";
-
-      if (text && activeRef.current && !isSendingRef.current) {
-        sendTextUtterance(text);
-        return;
-      }
-
-      if (
-        activeRef.current &&
-        !isSendingRef.current &&
-        phaseRef.current === "listening"
-      ) {
-        window.setTimeout(() => startRecognition(), 120);
-      }
-    };
 
     recognitionRef.current = recognition;
     return true;

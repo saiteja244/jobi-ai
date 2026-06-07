@@ -16,7 +16,7 @@ export function isBrowserTtsSupported() {
   return typeof window !== "undefined" && "speechSynthesis" in window;
 }
 
-export function createSpeechRecognizer({ onFinal, onInterim, onError }) {
+export function createSpeechRecognizer({ onFinal, onInterim, onError, onEnd }) {
   if (!SpeechRecognition) return null;
 
   const recognition = new SpeechRecognition();
@@ -55,6 +55,7 @@ export function createSpeechRecognizer({ onFinal, onInterim, onError }) {
       onFinal(finalTranscript.trim());
       finalTranscript = "";
     }
+    onEnd?.();
   };
 
   return recognition;
@@ -118,60 +119,75 @@ function createUtterance(text) {
   return utterance;
 }
 
-export function createSpeechSpeaker() {
+export function createSpeechSpeaker({ onIdle } = {}) {
   let buffer = "";
   let spokenChars = 0;
   let speaking = false;
   let cancelled = false;
+  let flushRequested = false;
+  let idleNotified = false;
 
-  const trySpeak = () => {
-    if (cancelled || speaking || !isBrowserTtsSupported()) return;
+  const notifyIdle = () => {
+    const remaining = buffer.slice(spokenChars).trim();
+    if (!flushRequested || speaking || remaining || idleNotified) return;
+    idleNotified = true;
+    window.setTimeout(() => onIdle?.(), 0);
+  };
 
-    const remaining = buffer.slice(spokenChars).trimStart();
-    const segment = extractSpeakableSegment(remaining);
-    if (!segment) return;
-
-    const startIdx = buffer.indexOf(segment, spokenChars);
-    if (startIdx === -1) return;
-
+  const speakSegment = (segment, endIndex) => {
     speaking = true;
+    idleNotified = false;
     const utterance = createUtterance(segment);
 
     utterance.onend = () => {
       speaking = false;
-      spokenChars = startIdx + segment.length;
+      spokenChars = endIndex;
       trySpeak();
+      notifyIdle();
     };
     utterance.onerror = () => {
       speaking = false;
-      spokenChars = startIdx + segment.length;
+      spokenChars = endIndex;
       trySpeak();
+      notifyIdle();
     };
 
     speechSynthesis.speak(utterance);
   };
 
+  function trySpeak() {
+    if (cancelled || speaking || !isBrowserTtsSupported()) return;
+
+    const remaining = buffer.slice(spokenChars).trimStart();
+    const segment = extractSpeakableSegment(remaining);
+    if (!segment) {
+      if (flushRequested && remaining) {
+        speakSegment(remaining, buffer.length);
+      } else {
+        notifyIdle();
+      }
+      return;
+    }
+
+    const startIdx = buffer.indexOf(segment, spokenChars);
+    if (startIdx === -1) return;
+
+    speakSegment(segment, startIdx + segment.length);
+  }
+
   return {
     append(delta) {
       if (!delta || cancelled) return;
       buffer += delta;
+      idleNotified = false;
       trySpeak();
     },
     flush() {
-      if (cancelled || speaking || !isBrowserTtsSupported()) return;
-      const remaining = buffer.slice(spokenChars).trim();
-      if (!remaining) return;
-      speaking = true;
-      const utterance = createUtterance(remaining);
-      utterance.onend = () => {
-        speaking = false;
-        spokenChars = buffer.length;
-      };
-      utterance.onerror = () => {
-        speaking = false;
-        spokenChars = buffer.length;
-      };
-      speechSynthesis.speak(utterance);
+      if (cancelled || !isBrowserTtsSupported()) return;
+      flushRequested = true;
+      idleNotified = false;
+      trySpeak();
+      notifyIdle();
     },
     stop() {
       cancelled = true;
@@ -181,10 +197,15 @@ export function createSpeechSpeaker() {
       buffer = "";
       spokenChars = 0;
       speaking = false;
+      flushRequested = false;
+      idleNotified = false;
       cancelled = false;
     },
     isActive() {
-      return speaking;
+      const hasPendingText = Boolean(buffer.slice(spokenChars).trim());
+      const browserSpeaking =
+        isBrowserTtsSupported() && speechSynthesis.speaking;
+      return speaking || browserSpeaking || (flushRequested && hasPendingText);
     },
   };
 }
