@@ -14,6 +14,8 @@ const VOLUME_THRESHOLD = 0.02;
 const MIN_BLOB_BYTES = 1000;
 const POST_SPEAK_COOLDOWN_MS = 300;
 const RETRY_COOLDOWN_MS = 1200;
+const RECOGNITION_RESTART_MS = 180;
+const RECOGNITION_RETRY_MS = 350;
 
 const USE_FAST_PATH = isBrowserSttSupported() && isBrowserTtsSupported();
 
@@ -174,6 +176,9 @@ export function useRealtimeVoice() {
   const audioPlayingRef = useRef(false);
   const abortRef = useRef(null);
   const recognitionRef = useRef(null);
+  const recognitionActiveRef = useRef(false);
+  const sendTextUtteranceRef = useRef(null);
+  const startRecognitionRef = useRef(null);
   const pendingTextRef = useRef("");
   const interimTextRef = useRef("");
   const speakerRef = useRef(null);
@@ -242,11 +247,61 @@ export function useRealtimeVoice() {
     }
   }, []);
 
+  const setupBrowserRecognition = useCallback(() => {
+    const recognition = createSpeechRecognizer({
+      onStart: () => {
+        recognitionActiveRef.current = true;
+        setPhaseSafe("listening");
+      },
+      onInterim: (text) => {
+        interimTextRef.current = text;
+        setInterimText(text);
+      },
+      onFinal: (text) => {
+        interimTextRef.current = "";
+        setInterimText("");
+        pendingTextRef.current = `${pendingTextRef.current} ${text}`.trim();
+      },
+      onError: (code) => {
+        recognitionActiveRef.current = false;
+        if (code === "not-allowed") {
+          setError("Microphone access denied for speech recognition.");
+        }
+      },
+      onEnd: () => {
+        recognitionActiveRef.current = false;
+        const text = pendingTextRef.current.trim();
+        pendingTextRef.current = "";
+
+        if (text && activeRef.current && !isSendingRef.current) {
+          sendTextUtteranceRef.current?.(text);
+          return;
+        }
+
+        if (
+          activeRef.current &&
+          !isSendingRef.current &&
+          phaseRef.current === "listening"
+        ) {
+          window.setTimeout(
+            () => startRecognitionRef.current?.(),
+            RECOGNITION_RESTART_MS
+          );
+        }
+      },
+    });
+
+    recognitionRef.current = recognition;
+    return Boolean(recognition);
+  }, []);
+
   const startRecognition = useCallback(() => {
     if (!USE_FAST_PATH || !activeRef.current || isSendingRef.current) return;
     if (Date.now() < listenAfterRef.current) return;
     if (Date.now() < retryAfterRef.current) return;
+    if (recognitionActiveRef.current) return;
 
+    if (!recognitionRef.current && !setupBrowserRecognition()) return;
     const rec = recognitionRef.current;
     if (!rec) return;
 
@@ -254,11 +309,19 @@ export function useRealtimeVoice() {
       speechStartedAtRef.current = null;
       silenceStartedAtRef.current = null;
       rec.start();
-      setPhaseSafe("listening");
     } catch {
-      /* already started */
+      recognitionRef.current = null;
+      recognitionActiveRef.current = false;
+      window.setTimeout(
+        () => startRecognitionRef.current?.(),
+        RECOGNITION_RETRY_MS
+      );
     }
-  }, []);
+  }, [setupBrowserRecognition]);
+
+  useEffect(() => {
+    startRecognitionRef.current = startRecognition;
+  }, [startRecognition]);
 
   const cleanupStream = useCallback(() => {
     if (abortRef.current) {
@@ -271,6 +334,7 @@ export function useRealtimeVoice() {
     }
     stopRecognition();
     recognitionRef.current = null;
+    recognitionActiveRef.current = false;
     if (mediaRecorderRef.current?.state === "recording") {
       try {
         mediaRecorderRef.current.stop();
@@ -432,6 +496,10 @@ export function useRealtimeVoice() {
     },
     [handleStreamEvents, startRecognition, stopRecognition, waitForSpeechThenListen]
   );
+
+  useEffect(() => {
+    sendTextUtteranceRef.current = sendTextUtterance;
+  }, [sendTextUtterance]);
 
   const sendAudioUtterance = useCallback(async () => {
     if (isSendingRef.current) return;
@@ -640,47 +708,6 @@ export function useRealtimeVoice() {
   useEffect(() => {
     vadLoopRef.current = runVadLoop;
   }, [runVadLoop]);
-
-  const setupBrowserRecognition = useCallback(() => {
-    const recognition = createSpeechRecognizer({
-      onInterim: (text) => {
-        interimTextRef.current = text;
-        setInterimText(text);
-      },
-      onFinal: (text) => {
-        interimTextRef.current = "";
-        setInterimText("");
-        pendingTextRef.current = `${pendingTextRef.current} ${text}`.trim();
-      },
-      onError: (code) => {
-        if (code === "not-allowed") {
-          setError("Microphone access denied for speech recognition.");
-        }
-      },
-      onEnd: () => {
-        const text = pendingTextRef.current.trim();
-        pendingTextRef.current = "";
-
-        if (text && activeRef.current && !isSendingRef.current) {
-          sendTextUtterance(text);
-          return;
-        }
-
-        if (
-          activeRef.current &&
-          !isSendingRef.current &&
-          phaseRef.current === "listening"
-        ) {
-          window.setTimeout(() => startRecognition(), 120);
-        }
-      },
-    });
-
-    if (!recognition) return false;
-
-    recognitionRef.current = recognition;
-    return true;
-  }, [sendTextUtterance, startRecognition]);
 
   const startConversation = useCallback(async () => {
     setError("");

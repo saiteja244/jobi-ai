@@ -16,7 +16,13 @@ export function isBrowserTtsSupported() {
   return typeof window !== "undefined" && "speechSynthesis" in window;
 }
 
-export function createSpeechRecognizer({ onFinal, onInterim, onError, onEnd }) {
+export function createSpeechRecognizer({
+  onStart,
+  onFinal,
+  onInterim,
+  onError,
+  onEnd,
+}) {
   if (!SpeechRecognition) return null;
 
   const recognition = new SpeechRecognition();
@@ -26,6 +32,10 @@ export function createSpeechRecognizer({ onFinal, onInterim, onError, onEnd }) {
   recognition.maxAlternatives = 1;
 
   let finalTranscript = "";
+
+  recognition.onstart = () => {
+    onStart?.();
+  };
 
   recognition.onresult = (event) => {
     let interim = "";
