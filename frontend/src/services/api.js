@@ -9,20 +9,34 @@ function fromBuildEnv() {
 }
 
 export function getApiBaseUrl() {
-  if (resolvedApiBase) return resolvedApiBase;
-  const fromEnv = fromBuildEnv();
-  if (fromEnv) return fromEnv;
-  if (typeof window !== "undefined" && window.__API_BASE__) {
-    return window.__API_BASE__;
+  let url = resolvedApiBase;
+  if (!url) {
+    const fromEnv = fromBuildEnv();
+    if (fromEnv) {
+      url = fromEnv;
+    } else if (typeof window !== "undefined" && window.__API_BASE__) {
+      url = window.__API_BASE__;
+    } else {
+      url = "/api";
+    }
   }
-  return "/api";
+
+  url = url.trim().replace(/\/$/, "");
+  if (url && url !== "/api" && !url.endsWith("/api")) {
+    url = `${url}/api`;
+  }
+  return url;
 }
 
 /** Load /api-config.json at startup (production fallback when VITE_API_URL is unset). */
 export async function loadApiConfig() {
   const fromEnv = fromBuildEnv();
   if (fromEnv) {
-    resolvedApiBase = fromEnv;
+    let url = fromEnv.trim().replace(/\/$/, "");
+    if (url && url !== "/api" && !url.endsWith("/api")) {
+      url = `${url}/api`;
+    }
+    resolvedApiBase = url;
     return resolvedApiBase;
   }
 
@@ -30,9 +44,13 @@ export async function loadApiConfig() {
     const response = await fetch("/api-config.json", { cache: "no-store" });
     if (response.ok) {
       const config = await response.json();
-      const url = config?.apiUrl?.trim();
+      let url = config?.apiUrl?.trim();
       if (url) {
-        resolvedApiBase = url.replace(/\/$/, "");
+        url = url.replace(/\/$/, "");
+        if (url && url !== "/api" && !url.endsWith("/api")) {
+          url = `${url}/api`;
+        }
+        resolvedApiBase = url;
         if (typeof window !== "undefined") {
           window.__API_BASE__ = resolvedApiBase;
         }
