@@ -60,33 +60,71 @@ def stream_voice_chat(audio_path, chat_history):
         chat_history.append(f"User: {user_text}")
 
         full_text = ""
-        first_segment = None
-        first_audio_sent = False
+        text_buffer = ""
+        is_first_segment = True
+
+        sentence_end_pattern = re.compile(r'([.!?])(\s+|$)', re.UNICODE)
 
         try:
             for delta in iter_voice_reply(user_text, chat_history[:-1]):
                 full_text += delta
+                text_buffer += delta
+
                 yield _line({"event": "delta", "delta": delta})
 
-                if not first_audio_sent:
-                    segment = _extract_first_segment(full_text)
-                    if segment:
-                        audio = text_to_speech_base64(
-                            segment, max_words=FIRST_TTS_MAX_WORDS
-                        )
-                        if audio:
-                            first_segment = segment
-                            first_audio_sent = True
-                            yield _line({
-                                "event": "audio",
-                                "audio": audio,
-                                "segment": "first",
-                            })
+                chunk = None
+                if is_first_segment:
+                    words = text_buffer.split()
+                    match = sentence_end_pattern.search(text_buffer)
+                    if match:
+                        split_idx = match.end()
+                        chunk = text_buffer[:split_idx].strip()
+                        text_buffer = text_buffer[split_idx:]
+                        is_first_segment = False
+                    elif len(words) >= 4:
+                        chunk = " ".join(words[:4])
+                        text_buffer = " ".join(words[4:])
+                        is_first_segment = False
+                else:
+                    match = sentence_end_pattern.search(text_buffer)
+                    if match:
+                        split_idx = match.end()
+                        chunk = text_buffer[:split_idx].strip()
+                        text_buffer = text_buffer[split_idx:]
+                    else:
+                        words = text_buffer.split()
+                        if len(words) >= 10:
+                            comma_match = re.search(r'([,;:\n])(\s+)', text_buffer)
+                            if comma_match:
+                                split_idx = comma_match.end()
+                                chunk = text_buffer[:split_idx].strip()
+                                text_buffer = text_buffer[split_idx:]
+                            else:
+                                chunk = " ".join(words[:8])
+                                text_buffer = " ".join(words[8:])
+
+                if chunk:
+                    audio = text_to_speech_base64(chunk)
+                    if audio:
+                        yield _line({
+                            "event": "audio",
+                            "audio": audio,
+                            "segment": chunk,
+                        })
 
         except RuntimeError as e:
             chat_history.pop()
             yield _line({"event": "error", "error": str(e)})
             return
+
+        if text_buffer.strip():
+            audio = text_to_speech_base64(text_buffer.strip())
+            if audio:
+                yield _line({
+                    "event": "audio",
+                    "audio": audio,
+                    "segment": text_buffer.strip(),
+                })
 
         full_text = truncate_words(full_text)
 
@@ -94,23 +132,6 @@ def stream_voice_chat(audio_path, chat_history):
             chat_history.pop()
             yield _line({"event": "error", "error": "AI returned an empty reply."})
             return
-
-        if not first_audio_sent and full_text.strip():
-            audio = text_to_speech_base64(full_text)
-            if audio:
-                first_segment = full_text
-                first_audio_sent = True
-                yield _line({"event": "audio", "audio": audio, "segment": "first"})
-        else:
-            remainder = _extract_remainder(full_text, first_segment or "")
-            if remainder and len(remainder.split()) >= 4:
-                audio = text_to_speech_base64(remainder)
-                if audio:
-                    yield _line({
-                        "event": "audio",
-                        "audio": audio,
-                        "segment": "rest",
-                    })
 
         chat_history.append(f"Assistant: {full_text}")
 

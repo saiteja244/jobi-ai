@@ -3,6 +3,7 @@ import os
 import re
 
 from flask import Blueprint, jsonify, request
+from werkzeug.utils import secure_filename
 
 from services.gpt_service import ask_gpt, parse_questions_json
 from services.interview_state import interview_state
@@ -33,7 +34,8 @@ def upload_resume():
     if not file.filename.lower().endswith(".pdf"):
         return jsonify({"error": "Only PDF resumes are supported"}), 400
 
-    path = os.path.join(UPLOAD_FOLDER, file.filename)
+    filename = secure_filename(file.filename)
+    path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(path)
 
     try:
@@ -74,27 +76,45 @@ Questions must be exactly 5 short interview questions.
     analysis = ""
     parsed_questions = None
 
-    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    # Try extracting outer braces first (most robust against markdown/prefixes)
     try:
-        data = json.loads(cleaned)
-        if isinstance(data, dict):
-            analysis = str(data.get("analysis", "")).strip()
-            if isinstance(data.get("questions"), list):
-                parsed_questions = [
-                    str(q).strip() for q in data["questions"] if str(q).strip()
-                ]
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if match:
-            try:
-                data = json.loads(match.group(0))
+        start_idx = raw.find('{')
+        end_idx = raw.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = raw[start_idx:end_idx+1]
+            data = json.loads(json_str)
+            if isinstance(data, dict):
                 analysis = str(data.get("analysis", "")).strip()
                 if isinstance(data.get("questions"), list):
                     parsed_questions = [
                         str(q).strip() for q in data["questions"] if str(q).strip()
                     ]
-            except json.JSONDecodeError:
-                pass
+    except Exception as e:
+        print("Failed parsing outer brace JSON:", e)
+
+    # Fallback to general parsing
+    if not parsed_questions:
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                analysis = str(data.get("analysis", "")).strip()
+                if isinstance(data.get("questions"), list):
+                    parsed_questions = [
+                        str(q).strip() for q in data["questions"] if str(q).strip()
+                    ]
+        except json.JSONDecodeError:
+            match = re.search(r"\{[\s\S]*\}", cleaned)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                    analysis = str(data.get("analysis", "")).strip()
+                    if isinstance(data.get("questions"), list):
+                        parsed_questions = [
+                            str(q).strip() for q in data["questions"] if str(q).strip()
+                        ]
+                except json.JSONDecodeError:
+                    pass
 
     if not analysis:
         analysis = cleaned

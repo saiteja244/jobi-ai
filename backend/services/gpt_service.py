@@ -343,9 +343,31 @@ def parse_questions_json(raw_text):
     if not raw_text:
         return None
 
-    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
-
     import json
+
+    # Try parsing array first
+    start_arr = raw_text.find('[')
+    end_arr = raw_text.rfind(']')
+    if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+        try:
+            data = json.loads(raw_text[start_arr:end_arr+1])
+            if isinstance(data, list):
+                return [str(q).strip() for q in data if str(q).strip()]
+        except json.JSONDecodeError:
+            pass
+
+    # Try parsing object next
+    start_obj = raw_text.find('{')
+    end_obj = raw_text.rfind('}')
+    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+        try:
+            data = json.loads(raw_text[start_obj:end_obj+1])
+            if isinstance(data, dict) and isinstance(data.get("questions"), list):
+                return [str(q).strip() for q in data["questions"] if str(q).strip()]
+        except json.JSONDecodeError:
+            pass
+
+    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
 
     try:
         data = json.loads(cleaned)
