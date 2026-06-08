@@ -18,7 +18,7 @@ const RECOGNITION_RESTART_MS = 180;
 const RECOGNITION_RETRY_MS = 350;
 const LISTEN_RESUME_GRACE_MS = 40;
 
-const USE_FAST_PATH = isBrowserSttSupported() && isBrowserTtsSupported();
+const USE_FAST_PATH = false;
 
 function getRmsVolume(analyser) {
   const data = new Uint8Array(analyser.fftSize);
@@ -32,6 +32,8 @@ function getRmsVolume(analyser) {
 }
 
 function playBase64Audio(base64Audio, audioRef, urlRef) {
+  console.log("Received audio");
+  console.log("Base64 length:", base64Audio?.length);
   return new Promise((resolve, reject) => {
     if (!base64Audio) {
       resolve();
@@ -39,10 +41,13 @@ function playBase64Audio(base64Audio, audioRef, urlRef) {
     }
 
     try {
+        console.log("Received audio");
+        console.log("Base64 length:", base64Audio?.length);
       const blob = new Blob(
         [Uint8Array.from(atob(base64Audio), (c) => c.charCodeAt(0))],
         { type: "audio/wav" }
       );
+      console.log("Audio MIME type:", blob.type);
       const url = URL.createObjectURL(blob);
       const audio = audioRef.current || new Audio();
       audioRef.current = audio;
@@ -67,7 +72,9 @@ function playBase64Audio(base64Audio, audioRef, urlRef) {
 
       audio.src = url;
       audio.currentTime = 0;
-      audio.play().catch(reject);
+      audio.play()
+      .then(() => console.log("Audio started"))
+      .catch(err => console.error("Audio play failed:", err));
     } catch (err) {
       reject(err);
     }
@@ -124,7 +131,7 @@ async function streamVoiceChat(formData, handlers) {
 }
 
 async function streamVoiceChatText(text, handlers) {
-  const response = await fetch(`${getApiBaseUrl()}/voice-text-stream`, {
+  const response = await fetch(`${getApiBaseUrl()}/voice-chat-stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
@@ -392,7 +399,10 @@ export function useRealtimeVoice() {
   const handleStreamEvents = useCallback(
   async (event, state) => {
     const { assistantTextRef, assistantMessageStartedRef } = state;
-
+    if (event.event === "audio") {
+    console.log("Sarvam audio received");
+    console.log("Audio size:", event.audio?.length);
+    }
     if (event.event === "transcript") {
       const userText = event.user_text || "";
       setMessages((prev) => [...prev, { role: "user", text: userText }]);
@@ -743,7 +753,7 @@ export function useRealtimeVoice() {
       speechSynthesis.getVoices();
     }
 
-    fetch(`${getApiBaseUrl()}/health`, { method: "GET" }).catch(() => {});
+    fetch(`${window.location.protocol}//localhost:5000/health`, { method: "GET" }).catch(() => {});
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({

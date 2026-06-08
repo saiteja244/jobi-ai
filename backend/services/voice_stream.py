@@ -146,7 +146,9 @@ def stream_voice_chat(audio_path, chat_history):
                                 text_buffer = " ".join(words[8:])
 
                 if chunk:
+                    print("Sending audio chunk:", chunk)
                     audio = text_to_speech_base64(chunk)
+                    print("Generated audio:", bool(audio))
                     if audio:
                         yield _line({
                             "event": "audio",
