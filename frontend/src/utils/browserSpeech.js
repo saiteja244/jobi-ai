@@ -3,10 +3,20 @@ const SpeechRecognition =
     ? window.SpeechRecognition || window.webkitSpeechRecognition
     : null;
 
-const SPEECH_RATE = 1.18;
-const SPEECH_PITCH = 1.02;
+const SPEECH_RATE = 1.14;
+const SPEECH_PITCH = 1;
 const MIN_SEGMENT_WORDS = 5;
 const FALLBACK_SEGMENT_WORDS = 9;
+const PREFERRED_VOICE_HINTS = [
+  "neerja",
+  "aria",
+  "jenny",
+  "sonia",
+  "natural",
+  "online",
+  "google us english",
+  "google uk english female",
+];
 
 export function isBrowserSttSupported() {
   return Boolean(SpeechRecognition);
@@ -95,6 +105,10 @@ function scoreVoice(voice) {
   else if (lang.startsWith("en-us")) score += 24;
   else if (lang.startsWith("en-gb")) score += 22;
   else if (lang.startsWith("en")) score += 16;
+
+  PREFERRED_VOICE_HINTS.forEach((hint, index) => {
+    if (name.includes(hint)) score += 28 - index;
+  });
 
   if (name.includes("natural")) score += 18;
   if (name.includes("online")) score += 12;

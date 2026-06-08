@@ -16,6 +16,7 @@ const POST_SPEAK_COOLDOWN_MS = 300;
 const RETRY_COOLDOWN_MS = 1200;
 const RECOGNITION_RESTART_MS = 180;
 const RECOGNITION_RETRY_MS = 350;
+const LISTEN_RESUME_GRACE_MS = 40;
 
 const USE_FAST_PATH = isBrowserSttSupported() && isBrowserTtsSupported();
 
@@ -376,13 +377,17 @@ export function useRealtimeVoice() {
 
       listenAfterRef.current = Date.now() + POST_SPEAK_COOLDOWN_MS;
       if (USE_FAST_PATH) {
-        startRecognition();
+        setPhaseSafe("listening");
+        window.setTimeout(
+          () => startRecognitionRef.current?.(),
+          POST_SPEAK_COOLDOWN_MS + LISTEN_RESUME_GRACE_MS
+        );
       } else if (activeRef.current) {
         setPhaseSafe("listening");
       }
     };
     check();
-  }, [startRecognition]);
+  }, []);
 
   const handleStreamEvents = useCallback(
   async (event, state) => {
@@ -500,6 +505,26 @@ export function useRealtimeVoice() {
   useEffect(() => {
     sendTextUtteranceRef.current = sendTextUtterance;
   }, [sendTextUtterance]);
+
+  useEffect(() => {
+    if (!active || !USE_FAST_PATH) return undefined;
+
+    const keepListening = window.setInterval(() => {
+      const readyToListen =
+        activeRef.current &&
+        phaseRef.current === "listening" &&
+        !isSendingRef.current &&
+        !recognitionActiveRef.current &&
+        Date.now() >= listenAfterRef.current &&
+        Date.now() >= retryAfterRef.current;
+
+      if (readyToListen) {
+        startRecognitionRef.current?.();
+      }
+    }, 500);
+
+    return () => window.clearInterval(keepListening);
+  }, [active]);
 
   const sendAudioUtterance = useCallback(async () => {
     if (isSendingRef.current) return;
