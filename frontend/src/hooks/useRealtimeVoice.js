@@ -5,13 +5,13 @@ import {
   createSpeechSpeaker,
 } from "../utils/browserSpeech";
 
-const SILENCE_MS = 250;
-const MIN_SPEECH_MS = 400;
-const MIN_RECORD_MS = 700;
-const VOLUME_THRESHOLD = 0.015;
+const SILENCE_MS = 120;
+const MIN_SPEECH_MS = 250;
+const MIN_RECORD_MS = 400;
+const VOLUME_THRESHOLD = 0.012;
 const INTERRUPTION_VOLUME_THRESHOLD = 0.08; // Adjust higher (e.g., 0.12) if your speakers bleed into the mic
-const MIN_BLOB_BYTES = 1000;
-const POST_SPEAK_COOLDOWN_MS = 80;
+const MIN_BLOB_BYTES = 600;
+const POST_SPEAK_COOLDOWN_MS = 50;
 const RETRY_COOLDOWN_MS = 1200;
 const RECOGNITION_RESTART_MS = 50;
 const RECOGNITION_RETRY_MS = 100;
