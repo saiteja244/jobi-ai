@@ -1,10 +1,9 @@
 import base64
 import os
 import uuid
+import ast
 
 from flask import Blueprint, Response, jsonify, request, stream_with_context
-
-import ast
 
 from routes.resume_routes import stored_resume
 from services.gpt_service import ask_gpt, ask_voice
@@ -34,6 +33,27 @@ def _encode_audio_file(audio_path):
         return ""
     with open(audio_path, "rb") as f:
         return base64.b64encode(f.read()).decode()
+
+
+def _apply_interruption_context(interrupted_context):
+    """
+    Helper function to safely mutate the global chat history 
+    if an interruption occurred mid-turn.
+    """
+    if not interrupted_context or not chat_history:
+        return
+
+    last_entry = chat_history[-1]
+    # Check if the last turn was indeed the assistant being spoken out loud
+    if last_entry.startswith("Assistant:"):
+        clean_context = interrupted_context.strip()
+        print(f"[Barge-in Context Link Reset] Original turn truncated to: '{clean_context}'")
+        
+        if clean_context:
+            chat_history[-1] = f"Assistant: {clean_context}..."
+        else:
+            # If nothing was uttered yet, just pop out the assistant slot entirely
+            chat_history.pop()
 
 
 @interview_bp.route("/compare-jd", methods=["POST"])
@@ -287,8 +307,13 @@ def voice_text_stream():
     """Fast path: client STT + client TTS; stream Gemini text only."""
     data = request.get_json(silent=True) or {}
     user_text = (data.get("text") or "").strip()
+    interrupted_context = data.get("interrupted_context")
+    
     if not user_text:
         return jsonify({"error": "No text provided"}), 400
+
+    # Process interruption adjustment before starting text streaming engine loops
+    _apply_interruption_context(interrupted_context)
 
     return Response(
         stream_with_context(stream_voice_chat_text(user_text, chat_history)),
@@ -304,6 +329,8 @@ def voice_text_stream():
 def voice_chat_stream():
     """Stream AI text + early TTS audio for low-latency voice replies."""
     audio = request.files.get("audio")
+    interrupted_context = request.form.get("interrupted_context")
+
     if not audio or not audio.filename:
         return jsonify({"error": "No audio file provided"}), 400
 
@@ -312,6 +339,9 @@ def voice_chat_stream():
 
     if file_size < 800:
         return jsonify({"error": "Recording too short. Please speak a bit longer."}), 400
+
+    # Process interruption adjustment before launching audio stream processing pipes
+    _apply_interruption_context(interrupted_context)
 
     return Response(
         stream_with_context(stream_voice_chat(path, chat_history)),

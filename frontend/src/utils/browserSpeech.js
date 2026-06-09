@@ -5,8 +5,8 @@ const SpeechRecognition =
 
 const SPEECH_RATE = 1.14;
 const SPEECH_PITCH = 1;
-const MIN_SEGMENT_WORDS = 5;
-const FALLBACK_SEGMENT_WORDS = 9;
+const MIN_SEGMENT_WORDS = 2;
+const FALLBACK_SEGMENT_WORDS = 4;
 const PREFERRED_VOICE_HINTS = [
   "neerja",
   "aria",
@@ -41,27 +41,31 @@ export function createSpeechRecognizer({
   recognition.lang = "en-IN";
   recognition.maxAlternatives = 1;
 
-  let finalTranscript = "";
-
   recognition.onstart = () => {
     onStart?.();
   };
 
   recognition.onresult = (event) => {
-    let interim = "";
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const result = event.results[i];
-      const text = result[0]?.transcript || "";
-      if (result.isFinal) {
-        finalTranscript += text;
+    let interimTranscript = "";
+    let finalTranscript = "";
+
+    // Fix: Process the entire results list on every match to isolate stable vs live streams
+    for (let i = event.resultIndex; i < event.results.length; ++i) {
+      if (event.results[i].isFinal) {
+        finalTranscript += event.results[i][0].transcript;
       } else {
-        interim += text;
+        interimTranscript += event.results[i][0].transcript;
       }
     }
-    if (interim && onInterim) onInterim(interim);
+
+    // Pass the real-time partial string immediately to wake up the hook's interruption trigger
+    if (interimTranscript && onInterim) {
+      onInterim(interimTranscript);
+    }
+
+    // Only broadcast finalization if the actual browser tracking engine confirms it is completely stable
     if (finalTranscript.trim() && onFinal) {
       onFinal(finalTranscript.trim());
-      finalTranscript = "";
     }
   };
 
@@ -71,10 +75,6 @@ export function createSpeechRecognizer({
   };
 
   recognition.onend = () => {
-    if (finalTranscript.trim() && onFinal) {
-      onFinal(finalTranscript.trim());
-      finalTranscript = "";
-    }
     onEnd?.();
   };
 

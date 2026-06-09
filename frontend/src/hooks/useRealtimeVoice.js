@@ -3,22 +3,21 @@ import API, { getApiBaseUrl } from "../services/api";
 import {
   createSpeechRecognizer,
   createSpeechSpeaker,
-  isBrowserSttSupported,
-  isBrowserTtsSupported,
 } from "../utils/browserSpeech";
 
-const SILENCE_MS = 600;
+const SILENCE_MS = 250;
 const MIN_SPEECH_MS = 400;
 const MIN_RECORD_MS = 700;
-const VOLUME_THRESHOLD = 0.02;
+const VOLUME_THRESHOLD = 0.015;
+const INTERRUPTION_VOLUME_THRESHOLD = 0.08; // Adjust higher (e.g., 0.12) if your speakers bleed into the mic
 const MIN_BLOB_BYTES = 1000;
-const POST_SPEAK_COOLDOWN_MS = 300;
+const POST_SPEAK_COOLDOWN_MS = 80;
 const RETRY_COOLDOWN_MS = 1200;
-const RECOGNITION_RESTART_MS = 180;
-const RECOGNITION_RETRY_MS = 350;
+const RECOGNITION_RESTART_MS = 50;
+const RECOGNITION_RETRY_MS = 100;
 const LISTEN_RESUME_GRACE_MS = 40;
 
-const USE_FAST_PATH = false;
+const USE_FAST_PATH = true;
 
 function getRmsVolume(analyser) {
   const data = new Uint8Array(analyser.fftSize);
@@ -32,8 +31,6 @@ function getRmsVolume(analyser) {
 }
 
 function playBase64Audio(base64Audio, audioRef, urlRef) {
-  console.log("Received audio");
-  console.log("Base64 length:", base64Audio?.length);
   return new Promise((resolve, reject) => {
     if (!base64Audio) {
       resolve();
@@ -41,13 +38,10 @@ function playBase64Audio(base64Audio, audioRef, urlRef) {
     }
 
     try {
-        console.log("Received audio");
-        console.log("Base64 length:", base64Audio?.length);
       const blob = new Blob(
         [Uint8Array.from(atob(base64Audio), (c) => c.charCodeAt(0))],
         { type: "audio/wav" }
       );
-      console.log("Audio MIME type:", blob.type);
       const url = URL.createObjectURL(blob);
       const audio = audioRef.current || new Audio();
       audioRef.current = audio;
@@ -73,8 +67,7 @@ function playBase64Audio(base64Audio, audioRef, urlRef) {
       audio.src = url;
       audio.currentTime = 0;
       audio.play()
-      .then(() => console.log("Audio started"))
-      .catch(err => console.error("Audio play failed:", err));
+        .catch(err => console.error("Audio play failed:", err));
     } catch (err) {
       reject(err);
     }
@@ -107,53 +100,6 @@ async function readNdjsonStream(response, onEvent) {
   }
 }
 
-async function streamVoiceChat(formData, handlers) {
-  const response = await fetch(`${getApiBaseUrl()}/voice-chat-stream`, {
-    method: "POST",
-    body: formData,
-  });
-
-  if (!response.ok) {
-    let message = "Voice request failed";
-    try {
-      const data = await response.json();
-      message = data.error || message;
-    } catch {
-      /* ignore */
-    }
-    const err = new Error(message);
-    err.status = response.status;
-    err.recoverable = response.status === 400;
-    throw err;
-  }
-
-  await readNdjsonStream(response, handlers.onEvent);
-}
-
-async function streamVoiceChatText(text, handlers) {
-  const response = await fetch(`${getApiBaseUrl()}/voice-chat-stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  });
-
-  if (!response.ok) {
-    let message = "Voice request failed";
-    try {
-      const data = await response.json();
-      message = data.error || message;
-    } catch {
-      /* ignore */
-    }
-    const err = new Error(message);
-    err.status = response.status;
-    err.recoverable = response.status === 400;
-    throw err;
-  }
-
-  await readNdjsonStream(response, handlers.onEvent);
-}
-
 export function useRealtimeVoice() {
   const [active, setActive] = useState(false);
   const [phase, setPhase] = useState("idle");
@@ -161,6 +107,12 @@ export function useRealtimeVoice() {
   const [error, setError] = useState("");
   const [liveLevel, setLiveLevel] = useState(0);
   const [interimText, setInterimText] = useState("");
+
+  // Control and interruption Refs
+  const streamAbortRef = useRef(null);
+  const interruptTimerRef = useRef(null);
+  const interruptionRef = useRef(false);
+  const partialAssistantTextRef = useRef(""); // Tracks precise context for backend matching
 
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -191,12 +143,12 @@ export function useRealtimeVoice() {
   const interimTextRef = useRef("");
   const speakerRef = useRef(null);
 
-  const setPhaseSafe = (next) => {
-    phaseRef.current = next;
-    setPhase(next);
+  const setPhaseSafe = (phase) => {
+    phaseRef.current = phase;
+    setPhase(phase);
   };
 
-  const stopPlayback = () => {
+  const stopPlayback = useCallback(() => {
     audioQueueRef.current = [];
     audioPlayingRef.current = false;
     speakerRef.current?.stop();
@@ -206,7 +158,7 @@ export function useRealtimeVoice() {
       audio.onended = null;
       audio.onerror = null;
     }
-  };
+  }, []);
 
   const revokePlaybackUrl = () => {
     const playbackUrl = playbackUrlRef.current;
@@ -216,54 +168,77 @@ export function useRealtimeVoice() {
     }
   };
 
-  const playNextInQueue = useCallback(async () => {
-    if (audioPlayingRef.current) return;
-    const next = audioQueueRef.current.shift();
-    if (!next) return;
+  const startRecognition = useCallback(() => {
+    if (!USE_FAST_PATH || !activeRef.current || isSendingRef.current) return;
+    if (Date.now() < listenAfterRef.current) return;
+    if (Date.now() < retryAfterRef.current) return;
+    if (recognitionActiveRef.current) return;
 
-    audioPlayingRef.current = true;
-    setPhaseSafe("speaking");
-
-    try {
-      await playBase64Audio(next, playbackAudioRef, playbackUrlRef);
-    } catch (e) {
-      console.warn("Audio playback:", e);
-    } finally {
-      audioPlayingRef.current = false;
-      if (audioQueueRef.current.length > 0) {
-        await playNextInQueue();
-      }
-    }
-  }, []);
-
-  const enqueueAudio = useCallback(
-    (base64) => {
-      if (!base64) return;
-      audioQueueRef.current.push(base64);
-      playNextInQueue();
-    },
-    [playNextInQueue]
-  );
-
-  const stopRecognition = useCallback(() => {
+    if (!recognitionRef.current && !setupBrowserRecognition()) return;
     const rec = recognitionRef.current;
     if (!rec) return;
+
     try {
-      rec.stop();
+      speechStartedAtRef.current = null;
+      silenceStartedAtRef.current = null;
+      rec.start();
     } catch {
-      /* ignore */
+      recognitionRef.current = null;
+      recognitionActiveRef.current = false;
+      window.setTimeout(
+        () => startRecognitionRef.current?.(),
+        RECOGNITION_RETRY_MS
+      );
     }
   }, []);
+
+  const interruptAssistant = useCallback((triggeringText = "") => {
+    if (interruptionRef.current) return;
+    interruptionRef.current = true;
+
+    console.log("Interrupting assistant. Logic trigger source:", triggeringText);
+
+    speakerRef.current?.stop();
+    stopPlayback();
+
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+
+    isSendingRef.current = false;
+    setPhaseSafe("listening");
+
+    if (!pendingTextRef.current && triggeringText && triggeringText !== "User interrupted speech") {
+      pendingTextRef.current = triggeringText;
+    }
+
+    window.setTimeout(() => {
+      startRecognitionRef.current?.();
+    }, 50);
+  }, [stopPlayback]);
 
   const setupBrowserRecognition = useCallback(() => {
     const recognition = createSpeechRecognizer({
+      onInterim(text) {
+        if (phaseRef.current !== "speaking") return;
+
+        const clean = text.trim();
+        if (clean.length < 3) return;
+
+        clearTimeout(interruptTimerRef.current);
+        interruptTimerRef.current = setTimeout(() => {
+          interruptAssistant(clean);
+          pendingTextRef.current = clean;
+
+          sendTextUtteranceRef.current?.(clean);
+        });
+      },
       onStart: () => {
         recognitionActiveRef.current = true;
-        setPhaseSafe("listening");
-      },
-      onInterim: (text) => {
-        interimTextRef.current = text;
-        setInterimText(text);
+        if (phaseRef.current !== "speaking") {
+          setPhaseSafe("listening");
+        }
       },
       onFinal: (text) => {
         interimTextRef.current = "";
@@ -301,37 +276,104 @@ export function useRealtimeVoice() {
 
     recognitionRef.current = recognition;
     return Boolean(recognition);
-  }, []);
-
-  const startRecognition = useCallback(() => {
-    if (!USE_FAST_PATH || !activeRef.current || isSendingRef.current) return;
-    if (Date.now() < listenAfterRef.current) return;
-    if (Date.now() < retryAfterRef.current) return;
-    if (recognitionActiveRef.current) return;
-
-    if (!recognitionRef.current && !setupBrowserRecognition()) return;
-    const rec = recognitionRef.current;
-    if (!rec) return;
-
-    try {
-      speechStartedAtRef.current = null;
-      silenceStartedAtRef.current = null;
-      rec.start();
-    } catch {
-      recognitionRef.current = null;
-      recognitionActiveRef.current = false;
-      window.setTimeout(
-        () => startRecognitionRef.current?.(),
-        RECOGNITION_RETRY_MS
-      );
-    }
-  }, [setupBrowserRecognition]);
+  }, [interruptAssistant]);
 
   useEffect(() => {
     startRecognitionRef.current = startRecognition;
   }, [startRecognition]);
 
+  const streamVoiceChat = useCallback(async (formData, handlers) => {
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    const response = await fetch(`${getApiBaseUrl()}/voice-chat-stream`, {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      let message = "Voice request failed";
+      try {
+        const data = await response.json();
+        message = data.error || message;
+      } catch { /* ignore */ }
+      const err = new Error(message);
+      err.status = response.status;
+      err.recoverable = response.status === 400;
+      throw err;
+    }
+    await readNdjsonStream(response, handlers.onEvent);
+  }, []);
+
+  const streamVoiceChatText = useCallback(async (text, context, handlers) => {
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    const response = await fetch(`${getApiBaseUrl()}/voice-text-stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        text, 
+        interrupted_context: context 
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      let message = "Voice request failed";
+      try {
+        const data = await response.json();
+        message = data.error || message;
+      } catch { /* ignore */ }
+      const err = new Error(message);
+      err.status = response.status;
+      err.recoverable = response.status === 400;
+      throw err;
+    }
+    await readNdjsonStream(response, handlers.onEvent);
+  }, []);
+
+  const playNextInQueue = useCallback(async () => {
+    if (audioPlayingRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) return;
+
+    audioPlayingRef.current = true;
+    setPhaseSafe("speaking");
+
+    try {
+      await playBase64Audio(next, playbackAudioRef, playbackUrlRef);
+    } catch (e) {
+      console.warn("Audio playback error:", e);
+    } finally {
+      audioPlayingRef.current = false;
+      if (audioQueueRef.current.length > 0) {
+        await playNextInQueue();
+      }
+    }
+  }, []);
+
+  const enqueueAudio = useCallback(
+    (base64) => {
+      if (!base64) return;
+      audioQueueRef.current.push(base64);
+      playNextInQueue();
+    },
+    [playNextInQueue]
+  );
+
+  const stopRecognition = useCallback(() => {
+    const rec = recognitionRef.current;
+    if (!rec) return;
+    try {
+      rec.stop();
+    } catch { /* ignore */ }
+  }, []);
+
   const cleanupStream = useCallback(() => {
+    if (interruptTimerRef.current) {
+      clearTimeout(interruptTimerRef.current);
+      interruptTimerRef.current = null;
+    }
     if (abortRef.current) {
       abortRef.current.abort();
       abortRef.current = null;
@@ -346,9 +388,7 @@ export function useRealtimeVoice() {
     if (mediaRecorderRef.current?.state === "recording") {
       try {
         mediaRecorderRef.current.stop();
-      } catch {
-        /* ignore */
-      }
+      } catch { /* ignore */ }
     }
     mediaRecorderRef.current = null;
     isCapturingRef.current = false;
@@ -397,74 +437,75 @@ export function useRealtimeVoice() {
   }, []);
 
   const handleStreamEvents = useCallback(
-  async (event, state) => {
-    const { assistantTextRef, assistantMessageStartedRef } = state;
-    if (event.event === "audio") {
-    console.log("Sarvam audio received");
-    console.log("Audio size:", event.audio?.length);
-    }
-    if (event.event === "transcript") {
-      const userText = event.user_text || "";
-      setMessages((prev) => [...prev, { role: "user", text: userText }]);
-    }
+    async (event, state) => {
+      const { assistantTextRef, assistantMessageStartedRef } = state;
+      if (event.event === "transcript") {
+        const userText = event.user_text || "";
+        setMessages((prev) => [...prev, { role: "user", text: userText }]);
+      }
+      if (streamAbortRef.current?.signal?.aborted) {
+        return;
+      }
+      if (event.event === "delta") {
+        const delta = event.delta || "";
+        assistantTextRef.current += delta;
+        
+        partialAssistantTextRef.current = assistantTextRef.current;
 
-    if (event.event === "delta") {
-      const delta = event.delta || "";
-      assistantTextRef.current += delta;
+        if (USE_FAST_PATH && speakerRef.current) {
+          speakerRef.current.append(delta);
+          setPhaseSafe("speaking");
+        }
 
-      if (USE_FAST_PATH && speakerRef.current) {
-        speakerRef.current.append(delta);
-        setPhaseSafe("speaking");
+        if (!assistantMessageStartedRef.current) {
+          assistantMessageStartedRef.current = true;
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", text: assistantTextRef.current },
+          ]);
+        } else {
+          const snapshot = assistantTextRef.current;
+          setMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last?.role === "assistant") {
+              updated[updated.length - 1] = { ...last, text: snapshot };
+            }
+            return updated;
+          });
+        }
       }
 
-      if (!assistantMessageStartedRef.current) {
-        assistantMessageStartedRef.current = true;
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", text: assistantTextRef.current },
-        ]);
-      } else {
-        const snapshot = assistantTextRef.current;
+      if (event.event === "audio" && event.audio && !USE_FAST_PATH) {
+        enqueueAudio(event.audio);
+      }
+
+      if (event.event === "done") {
+        const finalText =
+          event.ai_text || event.ai_response || assistantTextRef.current;
+        assistantTextRef.current = finalText;
+        partialAssistantTextRef.current = ""; 
+        if (USE_FAST_PATH) {
+          speakerRef.current?.flush();
+        }
         setMessages((prev) => {
           const updated = [...prev];
           const last = updated[updated.length - 1];
           if (last?.role === "assistant") {
-            updated[updated.length - 1] = { ...last, text: snapshot };
+            updated[updated.length - 1] = { ...last, text: finalText };
+          } else if (finalText) {
+            updated.push({ role: "assistant", text: finalText });
           }
           return updated;
         });
       }
-    }
 
-    if (event.event === "audio" && event.audio && !USE_FAST_PATH) {
-      enqueueAudio(event.audio);
-    }
-
-    if (event.event === "done") {
-      const finalText =
-        event.ai_text || event.ai_response || assistantTextRef.current;
-      assistantTextRef.current = finalText;
-      if (USE_FAST_PATH) {
-        speakerRef.current?.flush();
+      if (event.event === "error") {
+        throw new Error(event.error || "Voice stream failed");
       }
-      setMessages((prev) => {
-        const updated = [...prev];
-        const last = updated[updated.length - 1];
-        if (last?.role === "assistant") {
-          updated[updated.length - 1] = { ...last, text: finalText };
-        } else if (finalText) {
-          updated.push({ role: "assistant", text: finalText });
-        }
-        return updated;
-      });
-    }
-
-    if (event.event === "error") {
-      throw new Error(event.error || "Voice stream failed");
-    }
-  },
-  [enqueueAudio]
-);
+    },
+    [enqueueAudio]
+  );
 
   const sendTextUtterance = useCallback(
     async (text) => {
@@ -476,6 +517,8 @@ export function useRealtimeVoice() {
       }
 
       isSendingRef.current = true;
+      const historyContext = partialAssistantTextRef.current; 
+      interruptionRef.current = false;
       stopRecognition();
       setInterimText("");
       setPhaseSafe("processing");
@@ -489,7 +532,7 @@ export function useRealtimeVoice() {
       const assistantMessageStartedRef = { current: false };
 
       try {
-        await streamVoiceChatText(trimmed, {
+        await streamVoiceChatText(trimmed, historyContext, {
           onEvent: (event) =>
             handleStreamEvents(event, {
               assistantTextRef,
@@ -498,18 +541,16 @@ export function useRealtimeVoice() {
         });
       } catch (err) {
         speakerRef.current?.stop();
-        if (err.recoverable || err.status === 400) {
-          retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
-        } else {
+        retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
+        if (!err.recoverable && err.status !== 400) {
           setError(err.message || "Voice request failed.");
-          retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
         }
-      } finally {
+      } {
         isSendingRef.current = false;
         waitForSpeechThenListen();
       }
     },
-    [handleStreamEvents, startRecognition, stopRecognition, waitForSpeechThenListen]
+    [handleStreamEvents, startRecognition, stopRecognition, waitForSpeechThenListen, streamVoiceChatText]
   );
 
   useEffect(() => {
@@ -542,15 +583,12 @@ export function useRealtimeVoice() {
       setPhaseSafe("listening");
       return;
     }
-
     if (!chunksRef.current.length) {
       setPhaseSafe("listening");
       return;
     }
 
-    const blob = new Blob(chunksRef.current, {
-      type: captureMimeRef.current,
-    });
+    const blob = new Blob(chunksRef.current, { type: captureMimeRef.current });
     chunksRef.current = [];
 
     if (blob.size < MIN_BLOB_BYTES) {
@@ -559,11 +597,15 @@ export function useRealtimeVoice() {
     }
 
     isSendingRef.current = true;
+    interruptionRef.current = false;
     setPhaseSafe("processing");
     setError("");
 
     const formData = new FormData();
     formData.append("audio", blob, "utterance.webm");
+    if (partialAssistantTextRef.current) {
+      formData.append("interrupted_context", partialAssistantTextRef.current);
+    }
 
     const assistantTextRef = { current: "" };
     const assistantMessageStartedRef = { current: false };
@@ -577,28 +619,23 @@ export function useRealtimeVoice() {
           }),
       });
     } catch (err) {
-      if (err.recoverable || err.status === 400) {
-        retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
-      } else {
+      retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
+      if (!err.recoverable && err.status !== 400) {
         setError(err.message || "Voice request failed.");
-        retryAfterRef.current = Date.now() + RETRY_COOLDOWN_MS;
       }
     } finally {
       isSendingRef.current = false;
       waitForSpeechThenListen();
     }
-  }, [handleStreamEvents, waitForSpeechThenListen]);
+  }, [handleStreamEvents, waitForSpeechThenListen, streamVoiceChat]);
 
   const startCapture = useCallback(() => {
-    if (!streamRef.current || isCapturingRef.current || isSendingRef.current) {
-      return;
-    }
+    if (!streamRef.current || isCapturingRef.current || isSendingRef.current) return;
     if (phaseRef.current !== "listening") return;
     if (Date.now() < listenAfterRef.current) return;
     if (Date.now() < retryAfterRef.current) return;
 
     chunksRef.current = [];
-
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
       ? "audio/webm;codecs=opus"
       : "audio/webm";
@@ -614,7 +651,6 @@ export function useRealtimeVoice() {
     recorder.onstop = () => {
       isCapturingRef.current = false;
       mediaRecorderRef.current = null;
-
       window.setTimeout(() => {
         if (activeRef.current && !isSendingRef.current) {
           sendAudioUtterance();
@@ -632,16 +668,9 @@ export function useRealtimeVoice() {
     const recorder = mediaRecorderRef.current;
     if (recorder?.state !== "recording") return;
 
-    const duration = speechStartedAtRef.current
-      ? Date.now() - speechStartedAtRef.current
-      : 0;
-
+    const duration = speechStartedAtRef.current ? Date.now() - speechStartedAtRef.current : 0;
     if (duration < MIN_RECORD_MS) {
-      try {
-        recorder.stop();
-      } catch {
-        /* ignore */
-      }
+      try { recorder.stop(); } catch {}
       chunksRef.current = [];
       isCapturingRef.current = false;
       mediaRecorderRef.current = null;
@@ -651,13 +680,9 @@ export function useRealtimeVoice() {
     }
 
     try {
-      if (typeof recorder.requestData === "function") {
-        recorder.requestData();
-      }
+      if (typeof recorder.requestData === "function") recorder.requestData();
       recorder.stop();
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }, []);
 
   const scheduleVadLoop = useCallback(() => {
@@ -671,27 +696,25 @@ export function useRealtimeVoice() {
     if (!analyser || !activeRef.current) return;
 
     const volume = getRmsVolume(analyser);
-
-    if (phaseRef.current === "listening") {
-      setLiveLevel(volume);
-    }
+    if (phaseRef.current === "listening") setLiveLevel(volume);
 
     const currentPhase = phaseRef.current;
     const loud = volume > VOLUME_THRESHOLD;
     const pastCooldown = Date.now() >= listenAfterRef.current;
     const pastRetry = Date.now() >= retryAfterRef.current;
 
+    // Hard Volume Interruption Bypass Logic Block
+    if (currentPhase === "speaking" && volume > INTERRUPTION_VOLUME_THRESHOLD) {
+      console.log("Barge-in volume threshold breached! Level:", volume);
+      interruptAssistant("User interrupted speech");
+      scheduleVadLoop();
+      return;
+    }
+
     if (USE_FAST_PATH) {
-      if (
-        currentPhase === "listening" &&
-        pastCooldown &&
-        pastRetry &&
-        !isSendingRef.current
-      ) {
+      if (currentPhase === "listening" && pastCooldown && pastRetry && !isSendingRef.current) {
         if (loud) {
-          if (!speechStartedAtRef.current) {
-            speechStartedAtRef.current = Date.now();
-          }
+          if (!speechStartedAtRef.current) speechStartedAtRef.current = Date.now();
           silenceStartedAtRef.current = null;
         } else if (speechStartedAtRef.current) {
           const speechDuration = Date.now() - speechStartedAtRef.current;
@@ -706,23 +729,14 @@ export function useRealtimeVoice() {
           }
         }
       }
-
       scheduleVadLoop();
       return;
     }
 
-    if (
-      currentPhase === "listening" &&
-      pastCooldown &&
-      pastRetry &&
-      !isSendingRef.current &&
-      !audioPlayingRef.current
-    ) {
+    if (currentPhase === "listening" && pastCooldown && pastRetry && !isSendingRef.current && !audioPlayingRef.current) {
       if (loud) {
         silenceStartedAtRef.current = null;
-        if (!isCapturingRef.current) {
-          startCapture();
-        }
+        if (!isCapturingRef.current) startCapture();
       } else if (isCapturingRef.current && speechStartedAtRef.current) {
         const speechDuration = Date.now() - speechStartedAtRef.current;
         if (speechDuration >= MIN_SPEECH_MS) {
@@ -736,9 +750,8 @@ export function useRealtimeVoice() {
         }
       }
     }
-
     scheduleVadLoop();
-  }, [scheduleVadLoop, startCapture, stopCapture, stopRecognition]);
+  }, [scheduleVadLoop, startCapture, stopCapture, stopRecognition, interruptAssistant]);
 
   useEffect(() => {
     vadLoopRef.current = runVadLoop;
@@ -749,19 +762,12 @@ export function useRealtimeVoice() {
     retryAfterRef.current = 0;
     listenAfterRef.current = 0;
 
-    if (typeof speechSynthesis !== "undefined") {
-      speechSynthesis.getVoices();
-    }
-
+    if (typeof speechSynthesis !== "undefined") speechSynthesis.getVoices();
     fetch(`${window.location.protocol}//localhost:5000/health`, { method: "GET" }).catch(() => {});
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
 
       streamRef.current = stream;
@@ -802,7 +808,7 @@ export function useRealtimeVoice() {
     setPhaseSafe("idle");
     setLiveLevel(0);
     setInterimText("");
-  }, [cleanupStream]);
+  }, [cleanupStream, stopPlayback]);
 
   const clearChat = useCallback(async () => {
     setError("");
@@ -821,7 +827,7 @@ export function useRealtimeVoice() {
       cleanupStream();
       revokePlaybackUrl();
     };
-  }, [cleanupStream]);
+  }, [cleanupStream, stopPlayback]);
 
   return {
     active,
