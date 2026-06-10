@@ -5,7 +5,7 @@ import {
   createSpeechSpeaker,
 } from "../utils/browserSpeech";
 
-const SILENCE_MS = 120;
+const SILENCE_MS = 2500;
 const MIN_SPEECH_MS = 250;
 const MIN_RECORD_MS = 400;
 const VOLUME_THRESHOLD = 0.012;
